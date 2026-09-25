@@ -39,6 +39,9 @@ let pendingData = null; // 待补评分名次边界最近一次只读结果（�
 let pendingReqId = 0; // 丢弃过期的名次边界响应
 let pendingSig = ""; // 最近一次名次边界所基于的（范围+最终分+评分数）签名
 let pendingStale = false; // 参数在上次计算后又被修改
+let commonJudgeData = null; // 同评委可比对照最近一次只读结果（不落库）
+let commonJudgeReqId = 0; // 丢弃过期的同评委对照响应
+let commonJudgeSig = ""; // 最近一次同评委对照所基于的（范围+最终分+评委覆盖）签名
 
 const $ = (sel) => document.querySelector(sel);
 const dashboard = $("#dashboard");
@@ -109,6 +112,11 @@ function render() {
     pendingSig = "";
     pendingStale = false;
     renderPendingPanel();
+    commonJudgeReqId += 1;
+    commonJudgeData = null;
+    commonJudgeSig = "";
+    setCjMsg("");
+    renderCommonJudgePanel();
     return;
   }
   emptyState.hidden = true;
@@ -171,6 +179,17 @@ function render() {
   renderPendingPanel();
   if (pendingAutoRun) runPendingCheck({ auto: true });
 
+  // 同评委可比对照依赖评分（评委覆盖）、逐项裁决与校准范围（最终分）；任一变化自动重算。
+  const cjs = commonJudgeSignature(analysis);
+  if (commonJudgeData && cjs !== commonJudgeSig) {
+    commonJudgeData = null;
+    setCjMsg("基础数据已变化（评分/裁决/校准范围），正在重新计算同评委可比对照…");
+    runCommonJudge();
+  } else if (!commonJudgeData) {
+    // 首次有数据或清空后：自动拉取一次。
+    runCommonJudge();
+  }
+
   const ref = analysis.reference;
   $("#reference-info").innerHTML =
     `校准范围：<b>${esc(analysis.scope_label)}</b><br>` +
@@ -196,6 +215,7 @@ function render() {
   refreshCompare();
   renderBackfillPanel();
   renderWeightPanel();
+  renderCommonJudgePanel();
 }
 
 // ---------- Ranking stability experiment ----------
@@ -1916,6 +1936,264 @@ pendingClearBtn.addEventListener("click", () => {
   renderPendingPanel();
   setPendingMsg("已清除结果，数据未做任何改动。", "ok");
 });
+
+// ---------- Common-judge comparable comparison (read-only) ----------
+const cjPanel = $("#cj-panel");
+
+function setCjMsg(text, cls = "") {
+  const el = $("#cj-msg");
+  if (el) {
+    el.textContent = text;
+    el.className = "msg " + cls;
+  }
+}
+
+// 结果依赖当前校准范围、逐项裁决（最终分）与评分本身（评委覆盖）。
+function commonJudgeSignature(a) {
+  const parts = ["scope:" + a.scope];
+  for (const b of a.contestants) {
+    for (const ib of b.items) {
+      for (const s of ib.scores) {
+        parts.push(`${b.contestant}|${ib.item}|${s.judge}=${Number(s.effective).toFixed(10)}`);
+      }
+    }
+  }
+  return parts.join("#");
+}
+
+function renderCommonJudgePanel() {
+  if (!cjPanel) return;
+  if (!analysis || analysis.counts.scores === 0) {
+    cjPanel.innerHTML = "";
+    return;
+  }
+  if (!commonJudgeData) {
+    cjPanel.innerHTML = "";
+    return;
+  }
+  const p = commonJudgeData;
+  const s = p.summary;
+
+  const banner = `
+    <div class="cj-banner">
+      共 <b>${s.contestants}</b> 名选手、<b>${s.items}</b> 个项目，选手对 <b>${s.pairs}</b> 对：
+      <b class="cj-ok">可比 ${s.comparable}</b> 对、
+      <span class="cj-no">不可比 ${s.incomparable}</span> 对
+      <span class="cj-note">（因缺项目 ${s.incomparable_missing_item_pairs} 对、无共同评委 ${s.incomparable_no_common_pairs} 对，按主因可重复计数）</span>。
+      可比对中：<b class="cj-a">A 领先 ${s.a_leads}</b>、<b class="cj-b">B 领先 ${s.b_leads}</b>、持平 ${s.ties}；
+      与全量最终总分方向对照：<b class="cj-reversed">反向 ${s.reversed}</b> 对、同向 ${s.same_direction} 对、全量总分并列 ${s.full_tie} 对。
+      <span class="cj-note">所有差值均为同一共同评委集合上的最终分均分差（A−B）；不可比项目不按零分。</span>
+    </div>`;
+
+  // 反向对置顶，其次可比对（按可比分差绝对值降序），最后不可比对；组内按全量名次。
+  const rankOf = {};
+  analysis.contestants.forEach((b) => { rankOf[b.contestant] = b.eff_rank; });
+  const ordered = p.pairs.slice().sort((p1, p2) => {
+    if (p1.reversed !== p2.reversed) return p1.reversed ? -1 : 1;
+    if (p1.comparable !== p2.comparable) return p1.comparable ? -1 : 1;
+    const d1 = p1.comparable ? Math.abs(p1.comparable_delta) : 0;
+    const d2 = p2.comparable ? Math.abs(p2.comparable_delta) : 0;
+    if (d1 !== d2) return d2 - d1;
+    return (rankOf[p1.a] - rankOf[p2.a]) || (rankOf[p1.b] - rankOf[p2.b]) ||
+      p1.a.localeCompare(p2.a) || p1.b.localeCompare(p2.b);
+  });
+
+  const leadBadge = (leader, labels) => {
+    if (leader === "a") return `<span class="cj-lead-a">${esc(labels.a || "A 领先")}</span>`;
+    if (leader === "b") return `<span class="cj-lead-b">${esc(labels.b || "B 领先")}</span>`;
+    if (leader === "tie") return `<span class="cj-tie">${esc(labels.tie || "持平")}</span>`;
+    return `<span class="cj-na">不可比</span>`;
+  };
+  const directionBadge = (pair) => {
+    if (pair.direction === "reversed") {
+      return `<span class="cj-dir-reversed">⚠ ${esc(pair.direction_label)}</span>`;
+    }
+    if (pair.direction === "same") return `<span class="cj-dir-same">${esc(pair.direction_label)}</span>`;
+    if (pair.direction === "full_tie") return `<span class="cj-dir-tie">${esc(pair.direction_label)}</span>`;
+    return `<span class="cj-dir-na">${esc(pair.direction_label)}</span>`;
+  };
+
+  const rows = ordered.map((pair, idx) => {
+    const coverage = pair.items
+      .filter((it) => it.comparable)
+      .map((it) => `${esc(it.item)}×${it.common_count}`)
+      .join("、") || '<span class="cj-no">—</span>';
+    const incNames = pair.items
+      .filter((it) => !it.comparable)
+      .map((it) => esc(it.item))
+      .join("、");
+    const compCell = pair.comparable
+      ? {
+          a: fmt(pair.a_comparable_total),
+          b: fmt(pair.b_comparable_total),
+          d: totalDeltaHtml(pair.comparable_delta),
+          lead: leadBadge(pair.comparable_leader, p.leader_labels),
+        }
+      : { a: "—", b: "—", d: '<span class="cj-na">—</span>', lead: '<span class="cj-na">不可比</span>' };
+
+    const detailItems = pair.items.map((it) => {
+      if (!it.comparable) {
+        let why;
+        if (it.reason === "missing_item") {
+          if (it.both_missing) why = "双方在该项目都没有评分";
+          else if (it.missing_side === pair.a) why = `<b>${esc(pair.a)}</b> 在该项目没有评分`;
+          else why = `<b>${esc(pair.b)}</b> 在该项目没有评分`;
+        } else {
+          const ja = it.a_judges ? it.a_judges.map((x) => esc(x.judge)).join("、") : "";
+          const jb = it.b_judges ? it.b_judges.map((x) => esc(x.judge)).join("、") : "";
+          why = `双方都有该项目但<b>没有共同评委</b>` +
+            (ja || jb ? `（${esc(pair.a)}：${ja || "无"}；${esc(pair.b)}：${jb || "无"}）` : "");
+        }
+        return `
+          <div class="cj-item cj-item-na">
+            <h5>${esc(it.item)} <span class="cj-item-badge">不可比 · ${esc(it.reason_label)}</span></h5>
+            <p class="hint" style="margin:2px 0;">${why}，<b>不按零分</b>，不计入可比总分差。</p>
+          </div>`;
+      }
+      const judgeRows = it.common_judges.map((j) => {
+        const av = it.a_judges.find((x) => x.judge === j);
+        const bv = it.b_judges.find((x) => x.judge === j);
+        const d = av.effective - bv.effective;
+        return `
+          <tr>
+            <td>${esc(j)}</td>
+            <td class="num">${fmt(av.effective)}</td>
+            <td class="num">${fmt(bv.effective)}</td>
+            <td class="num">${totalDeltaHtml(d)}</td>
+          </tr>`;
+      }).join("");
+      const onlyA = it.a_judges.filter((x) => !it.common_judges.includes(x.judge)).map((x) => esc(x.judge));
+      const onlyB = it.b_judges.filter((x) => !it.common_judges.includes(x.judge)).map((x) => esc(x.judge));
+      const coverNote = (list, who) => list.length
+        ? `<span class="cj-extra-judges">${who}另评但非共同：${list.join("、")}（不参与同评委均分）</span>` : "";
+      const lead = it.leader === "a"
+        ? `<span class="cj-lead-a">${esc(pair.a)} 领先</span>`
+        : it.leader === "b"
+          ? `<span class="cj-lead-b">${esc(pair.b)} 领先</span>`
+          : '<span class="cj-tie">持平</span>';
+      return `
+        <div class="cj-item cj-item-ok">
+          <h5>${esc(it.item)}
+            <span class="cj-item-badge cj-item-ok-badge">可比 · 共同评委 ${it.common_count} 人：${it.common_judges.map(esc).join("、")}</span>
+          </h5>
+          <div class="table-wrap cj-judge-wrap"><table>
+            <tr><th>共同评委</th><th class="num">${esc(pair.a)} 最终分</th><th class="num">${esc(pair.b)} 最终分</th><th class="num">差 (A−B)</th></tr>
+            ${judgeRows}
+            <tr class="cj-avg-row">
+              <td><b>共同评委均分</b></td>
+              <td class="num"><b>${fmt(it.a_avg)}</b></td>
+              <td class="num"><b>${fmt(it.b_avg)}</b></td>
+              <td class="num">${totalDeltaHtml(it.delta)}　${lead}</td>
+            </tr>
+          </table></div>
+          <p class="hint cj-cover-note" style="margin:4px 0 0;">
+            全量项目均分（含非共同评委）：${esc(pair.a)} ${fmt(it.a_full_avg)}｜${esc(pair.b)} ${fmt(it.b_full_avg)}。
+            ${coverNote(onlyA, esc(pair.a))}${coverNote(onlyB, esc(pair.b))}
+          </p>
+        </div>`;
+    }).join("");
+
+    const detailRow = `
+      <tr class="cj-detail-row" data-detail="${idx}" hidden>
+        <td colspan="10">
+          <div class="cj-detail">
+            <div class="cj-detail-summary">
+              可比项目 <b>${pair.comparable_items}</b> 个、不可比项目 <b>${pair.incomparable_items}</b> 个。
+              可比总分 = 各可比项目的<b>同评委均分</b>之和：
+              <b>${esc(pair.a)}</b> ${pair.comparable ? fmt(pair.a_comparable_total) : "—"}
+              ｜ <b>${esc(pair.b)}</b> ${pair.comparable ? fmt(pair.b_comparable_total) : "—"}。
+              现有全量最终总分：<b>${esc(pair.a)}</b> ${fmt(pair.a_full_total)}（第 ${pair.a_rank} 名）
+              ｜ <b>${esc(pair.b)}</b> ${fmt(pair.b_full_total)}（第 ${pair.b_rank} 名）。
+            </div>
+            ${detailItems}
+          </div>
+        </td>
+      </tr>`;
+
+    return `
+      <tr class="cj-row${pair.reversed ? " cj-reversed-row" : ""}${pair.comparable ? "" : " cj-incomparable-row"}" data-row="${idx}">
+        <td><span class="cj-toggle" data-toggle="${idx}">▸</span></td>
+        <td class="cj-pair-name">#${pair.a_rank} <b>${esc(pair.a)}</b><span class="cj-vs"> / </span>#${pair.b_rank} <b>${esc(pair.b)}</b></td>
+        <td class="num">${pair.comparable_items} / ${s.items}</td>
+        <td class="cj-coverage">${coverage}${incNames ? `<div class="cj-inc-names">不可比：${incNames}</div>` : ""}</td>
+        <td class="num">${fmt(pair.a_full_total)}</td>
+        <td class="num">${fmt(pair.b_full_total)}</td>
+        <td class="num">${totalDeltaHtml(pair.full_delta)}<div class="cj-sub">${leadBadge(pair.full_leader, { a: pair.a, b: pair.b, tie: "并列" })}</div></td>
+        <td class="num">${compCell.a}<br>${compCell.b}</td>
+        <td class="num">${compCell.d}<div class="cj-sub">${compCell.lead}</div></td>
+        <td>${directionBadge(pair)}</td>
+      </tr>
+      ${detailRow}`;
+  }).join("");
+
+  cjPanel.innerHTML = banner + `
+    <div class="table-wrap cj-table-wrap"><table>
+      <tr>
+        <th></th>
+        <th>选手对（A / B）</th>
+        <th class="num">可比<br>项目数</th>
+        <th>共同评委覆盖<br><small>（项目×评委数）</small></th>
+        <th class="num">全量最终分<br>A</th>
+        <th class="num">全量最终分<br>B</th>
+        <th class="num">全量总分差<br>(A−B)</th>
+        <th class="num">可比总分<br>A / B</th>
+        <th class="num">可比总分差<br>(A−B) / 领先</th>
+        <th>方向对照</th>
+      </tr>
+      ${rows}
+    </table></div>
+    <p class="hint cj-foot" style="margin-bottom:0;">
+      「全量最终分」为各项目全部参评评委均分再跨项目求和的现有最终总分；「可比总分」仅汇总逐项目<b>共同评委</b>均分。
+      两种口径方向相反的选手对标为<b class="cj-reversed">反向</b>并置顶；不可比选手对不按 0 分、不参与方向对照。
+      点行首箭头展开可查看逐项目共同评委与每位评委的最终分明细。本面板只读，评分、裁决或校准范围变化后自动重算。
+    </p>`;
+
+  cjPanel.querySelectorAll(".cj-toggle").forEach((toggle) => {
+    toggle.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const idx = toggle.dataset.toggle;
+      const detail = cjPanel.querySelector(`.cj-detail-row[data-detail="${idx}"]`);
+      const row = cjPanel.querySelector(`.cj-row[data-row="${idx}"]`);
+      if (detail.hasAttribute("hidden")) {
+        detail.removeAttribute("hidden");
+        toggle.textContent = "▾";
+        row.classList.add("cj-open");
+      } else {
+        detail.setAttribute("hidden", "");
+        toggle.textContent = "▸";
+        row.classList.remove("cj-open");
+      }
+    });
+  });
+  cjPanel.querySelectorAll(".cj-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      cjPanel.querySelector(`.cj-toggle[data-toggle="${row.dataset.row}"]`)?.click();
+    });
+  });
+  cjPanel.querySelectorAll(".cj-detail-row").forEach((detail) => {
+    detail.addEventListener("click", (ev) => ev.stopPropagation());
+  });
+}
+
+function runCommonJudge() {
+  if (!analysis || analysis.counts.scores === 0) return;
+  const myId = ++commonJudgeReqId;
+  setCjMsg("同评委可比对照计算中…");
+  api(`/api/sessions/${SESSION_ID}/common-judge`)
+    .then((data) => {
+      if (myId !== commonJudgeReqId) return;
+      commonJudgeData = data;
+      commonJudgeSig = commonJudgeSignature(analysis);
+      setCjMsg("");
+      renderCommonJudgePanel();
+    })
+    .catch((err) => {
+      if (myId !== commonJudgeReqId) return;
+      commonJudgeData = null;
+      setCjMsg(err.message, "error");
+      renderCommonJudgePanel();
+    });
+}
 
 // ---------- Decision updates ----------
 let inflight = false;

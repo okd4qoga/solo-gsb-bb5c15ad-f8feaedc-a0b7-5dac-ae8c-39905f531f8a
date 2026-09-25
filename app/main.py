@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import database as db
 from .backfill import BackfillValidationError, plan_backfill
+from .common_judge import common_judge_comparison
 from .csv_io import CSVParseError, build_audit_csv, parse_scores
 from .judge_offsets import judge_offset_diagnosis
 from .merge import (
@@ -466,6 +467,27 @@ def compare_two_contestants(session_id: str, a: str, b: str) -> dict[str, Any]:
         return compare_contestants(analysis, a, b)
     except (LookupError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/sessions/{session_id}/common-judge")
+def common_judge(session_id: str) -> dict[str, Any]:
+    """同评委可比对照（只读）。
+
+    在当前最终分上，对每对选手逐项目只取双方共同评分的评委，分别求同一
+    评委集合的均分，再汇总各可比项目的差值；没有共同评委或一方缺项目的
+    项目列为不可比、不按零分；全部项目不可比的选手对整对不可比。结果给出
+    各项目共同评委覆盖与差值、可比领先者，并与现有全量最终总分方向对照，
+    标出反向的选手对。每次请求实时重算，反映最新校准范围与逐项裁决，
+    不写入评分、裁决或会话。
+    """
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+    if analysis["counts"]["scores"] == 0:
+        raise HTTPException(status_code=404, detail="当前会话没有评分数据，无法进行同评委可比对照。")
+    return common_judge_comparison(analysis)
 
 
 @app.get("/api/sessions/{session_id}/judge-offsets")

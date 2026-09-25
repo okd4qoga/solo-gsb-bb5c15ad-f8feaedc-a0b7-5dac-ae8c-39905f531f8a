@@ -512,6 +512,46 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(g["comparable_pairs"], 0)
         self.assertIsNone(g["discordance_rate"])
 
+    def test_24_common_judge_endpoint_readonly(self):
+        # 构造同评委可比对照数据：A/B 在 I1 有共同评委 J1/J2，在 I2 无共同评委。
+        csv_body = (
+            "选手,评委,项目,分数\n"
+            "A,J1,I1,8\nA,J2,I1,6\nA,J1,I2,10\n"
+            "B,J1,I1,7\nB,J2,I1,5\nB,J2,I2,9\n"
+            "C,J3,I1,5\n"
+        )
+        client.post(
+            f"/api/sessions/{SID}/upload?scope=judge",
+            files={"file": ("cj.csv", csv_body.encode("utf-8-sig"), "text/csv")},
+        )
+        r = client.get(f"/api/sessions/{SID}/common-judge")
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["scope"], "judge")
+        s = data["summary"]
+        self.assertEqual(s["pairs"], 3)
+        self.assertEqual(s["comparable"], 1)
+        self.assertEqual(s["incomparable"], 2)
+        ab = next(p for p in data["pairs"] if {p["a"], p["b"]} == {"A", "B"})
+        self.assertTrue(ab["comparable"])
+        i1 = next(it for it in ab["items"] if it["item"] == "I1")
+        self.assertEqual(i1["common_judges"], ["J1", "J2"])
+        self.assertAlmostEqual(i1["a_avg"], 7.0)
+        self.assertAlmostEqual(i1["b_avg"], 6.0)
+        i2 = next(it for it in ab["items"] if it["item"] == "I2")
+        self.assertFalse(i2["comparable"])
+        self.assertEqual(i2["reason"], "no_common_judge")
+        # 只读：不改变任何裁决与总分。
+        again = client.get(f"/api/sessions/{SID}/analysis").json()
+        self.assertEqual(again["counts"]["decisions"], 0)
+        # 未知会话 → 404。
+        self.assertEqual(client.get("/api/sessions/nope/common-judge").status_code, 404)
+        # 范围切换反映在响应上。
+        client.post(f"/api/sessions/{SID}/scope", json={"scope": "judge_item"})
+        scoped = client.get(f"/api/sessions/{SID}/common-judge").json()
+        self.assertEqual(scoped["scope"], "judge_item")
+        client.post(f"/api/sessions/{SID}/scope", json={"scope": "judge"})
+
 
 if __name__ == "__main__":
     unittest.main()
