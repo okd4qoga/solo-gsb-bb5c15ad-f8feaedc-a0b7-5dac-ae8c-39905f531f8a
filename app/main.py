@@ -30,6 +30,7 @@ from .rules import (
     normalize_rules,
     score_rows_from_analysis,
 )
+from .same_judge_compare import same_judge_comparison
 from .scoring import (
     SCOPES,
     SCOPE_JUDGE,
@@ -466,6 +467,26 @@ def compare_two_contestants(session_id: str, a: str, b: str) -> dict[str, Any]:
         return compare_contestants(analysis, a, b)
     except (LookupError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/sessions/{session_id}/same-judge-compare")
+def same_judge_compare(session_id: str) -> dict[str, Any]:
+    """同评委可比对照（只读，基于当前最终分逐对、逐项目实时重算）。
+
+    对每对选手逐项目只取双方**共同评分的评委**，分别在同一共同评委集合上
+    对当前最终分求均值并汇总各项目差值；没有共同评委或一方缺项目的项目列为
+    不可比（**不按零分**），没有任何可比项目的选手对整体不可比。结果再与现有
+    全量最终总分方向对照，标出反向的选手对。每次请求都从当前评分、裁决与校准
+    范围重新计算，**不写入评分、裁决或会话**。
+    """
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+    if analysis["counts"]["scores"] == 0:
+        raise HTTPException(status_code=404, detail="当前会话没有评分数据，无法进行同评委可比对照。")
+    return same_judge_comparison(analysis)
 
 
 @app.get("/api/sessions/{session_id}/judge-offsets")
